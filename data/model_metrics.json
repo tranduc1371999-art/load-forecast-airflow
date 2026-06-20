@@ -1,0 +1,16 @@
+{
+  "mode": "real_time_minus_2_years_simulation",
+  "model_name": "PyTorch LSTM",
+  "real_now": "2026-06-21 00:25:30.206384",
+  "simulated_now": "2024-06-21 00:15:00",
+  "current_date": "2024-06-21",
+  "forecast_target_date": "2024-06-22",
+  "train_period": "2020-01-01 to 2024-12-31",
+  "target": "Load Demand (kW)",
+  "metrics": {
+    "mae": 1.1293,
+    "rmse": 1.3716,
+    "mape": 0.0782
+  },
+  "generated_at": "2026-06-21T00:25:30.466425"
+}
