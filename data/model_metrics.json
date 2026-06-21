@@ -10,9 +10,9 @@
   "validation_start": "2025-03-02 23:45:00",
   "target": "Load Demand (kW)",
   "metrics": {
-    "mae": 1.4084,
-    "rmse": 5.9875,
-    "mape": 0.108
+    "mae": 30.1915,
+    "rmse": 38.0049,
+    "mape": 2.0359
   },
-  "generated_at": "2026-06-21T16:39:18.674185"
+  "generated_at": "2026-06-21T21:59:10.537550"
 }

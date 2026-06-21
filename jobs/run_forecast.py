@@ -13,7 +13,6 @@ import joblib
 import numpy as np
 import pandas as pd
 from sklearn.ensemble import HistGradientBoostingRegressor
-from sklearn.linear_model import LinearRegression
 from sklearn.metrics import mean_absolute_error, mean_squared_error
 
 from preprocessing import TARGET_COLUMN
@@ -41,6 +40,56 @@ MEDIUM_TERM_DAYS = 180
 LONG_TERM_MONTHS = 36
 LAG_STEPS = [1, 4, 96, 192, 672]
 ROLLING_WINDOWS = [4, 96, 672]
+LONG_TERM_HISTORY_MONTHS = 36
+LONG_TERM_SCENARIOS = {
+    "low_demand": {
+        "demand_multiplier": 0.96,
+        "annual_growth": 0.006,
+    },
+    "baseline": {
+        "demand_multiplier": 1.00,
+        "annual_growth": 0.018,
+    },
+    "high_demand": {
+        "demand_multiplier": 1.08,
+        "annual_growth": 0.035,
+    },
+}
+
+SHORT_TERM_EXTERNAL_FEATURE_PREFIXES = [
+    "Temperature",
+    "Humidity",
+    "Wind Speed",
+    "Rainfall",
+    "Solar Irradiance",
+    "Electricity Price",
+    "Public Event",
+]
+
+CALENDAR_FEATURE_COLUMNS = [
+    "hour",
+    "minute",
+    "dayofweek",
+    "day",
+    "month",
+    "quarter",
+    "year",
+    "dayofyear",
+    "weekofyear",
+    "is_weekend",
+    "is_month_start",
+    "is_month_end",
+    "is_business_hours",
+    "minute_of_day",
+    "minute_of_week",
+    "season_no",
+    "hour_sin",
+    "hour_cos",
+    "dow_sin",
+    "dow_cos",
+    "month_sin",
+    "month_cos",
+]
 
 
 def prepare_directories():
@@ -48,13 +97,19 @@ def prepare_directories():
     (BASE_DIR / "data").mkdir(parents=True, exist_ok=True)
 
 
-def model_artifacts_are_current() -> bool:
-    return (
+def model_artifacts_are_current(expected_feature_columns: list[str]) -> bool:
+    if not (
         MODEL_PATH.exists()
         and FEATURE_COLUMNS_PATH.exists()
         and MODEL_PATH.stat().st_mtime >= DATA_PATH.stat().st_mtime
         and FEATURE_COLUMNS_PATH.stat().st_mtime >= DATA_PATH.stat().st_mtime
-    )
+    ):
+        return False
+
+    with open(FEATURE_COLUMNS_PATH, "r", encoding="utf-8") as f:
+        saved_feature_columns = json.load(f)
+
+    return saved_feature_columns == expected_feature_columns
 
 
 def load_dataset() -> pd.DataFrame:
@@ -108,10 +163,31 @@ def add_calendar_features(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def numeric_external_columns(df: pd.DataFrame) -> list[str]:
-    return [
-        col for col in df.select_dtypes(include=[np.number]).columns
-        if col != TARGET_COLUMN
+    numeric_columns = set(df.select_dtypes(include=[np.number]).columns)
+    selected_columns = []
+
+    for prefix in SHORT_TERM_EXTERNAL_FEATURE_PREFIXES:
+        matched_columns = [
+            col for col in df.columns
+            if col in numeric_columns and col.startswith(prefix)
+        ]
+        selected_columns.extend(matched_columns)
+
+    return list(dict.fromkeys(selected_columns))
+
+
+def model_feature_columns(frame: pd.DataFrame) -> list[str]:
+    external_columns = numeric_external_columns(frame)
+    calendar_columns = [
+        col for col in CALENDAR_FEATURE_COLUMNS
+        if col in frame.columns
     ]
+    load_history_columns = [
+        col for col in frame.columns
+        if col.startswith("load_lag_") or col.startswith("load_rolling_")
+    ]
+
+    return external_columns + calendar_columns + load_history_columns
 
 
 def add_load_lags(df: pd.DataFrame) -> pd.DataFrame:
@@ -154,14 +230,12 @@ def calculate_metrics(actual, forecast):
     }
 
 
-def train_short_term_model(frame: pd.DataFrame):
+def train_short_term_model(frame: pd.DataFrame, feature_columns: list[str]):
     print("========== TRAIN SHORT/MEDIUM TERM MODEL ==========")
 
     validation_start = frame.index.max() - pd.Timedelta(days=90)
     train_df = frame[frame.index < validation_start].copy()
     test_df = frame[frame.index >= validation_start].copy()
-
-    feature_columns = [col for col in frame.columns if col != TARGET_COLUMN]
 
     model = HistGradientBoostingRegressor(
         loss="squared_error",
@@ -421,38 +495,61 @@ def build_long_term_scenarios(df: pd.DataFrame):
         .reset_index()
     )
 
-    monthly["month_no"] = np.arange(len(monthly))
     future_months = pd.date_range(
         start=(df.index.max() + pd.offsets.MonthBegin(1)).normalize(),
         periods=LONG_TERM_MONTHS,
         freq="MS",
     )
-    future_no = pd.DataFrame(
-        {"month_no": np.arange(len(monthly), len(monthly) + LONG_TERM_MONTHS)}
-    )
 
-    avg_model = LinearRegression()
-    peak_model = LinearRegression()
-    avg_model.fit(monthly[["month_no"]], monthly["actual_avg_load"])
-    peak_model.fit(monthly[["month_no"]], monthly["actual_peak_load"])
+    monthly["month"] = monthly["Timestamp"].dt.month
+    history = monthly.tail(LONG_TERM_HISTORY_MONTHS).copy()
 
-    base_avg = avg_model.predict(future_no)
-    base_peak = peak_model.predict(future_no)
+    avg_overall = history["actual_avg_load"].mean()
+    peak_overall = history["actual_peak_load"].mean()
+    avg_seasonal_factor = (
+        history.groupby("month")["actual_avg_load"].mean() / avg_overall
+    ).to_dict()
+    peak_seasonal_factor = (
+        history.groupby("month")["actual_peak_load"].mean() / peak_overall
+    ).to_dict()
+
+    avg_base_level = (
+        history["actual_avg_load"]
+        / history["month"].map(avg_seasonal_factor)
+    ).mean()
+    peak_base_level = (
+        history["actual_peak_load"]
+        / history["month"].map(peak_seasonal_factor)
+    ).mean()
 
     scenario_rows = []
-    scenarios = {
-        "low_demand": 0.95,
-        "baseline": 1.00,
-        "high_demand": 1.08,
-    }
+    for scenario, config in LONG_TERM_SCENARIOS.items():
+        multiplier = config["demand_multiplier"]
+        annual_growth = config["annual_growth"]
 
-    for scenario, multiplier in scenarios.items():
-        for timestamp, avg_load, peak_load in zip(future_months, base_avg, base_peak):
+        for month_index, timestamp in enumerate(future_months, start=1):
+            years_ahead = month_index / 12
+            growth_factor = (1 + annual_growth) ** years_ahead
+            month = timestamp.month
+
+            avg_load = (
+                avg_base_level
+                * avg_seasonal_factor.get(month, 1.0)
+                * growth_factor
+                * multiplier
+            )
+            peak_load = (
+                peak_base_level
+                * peak_seasonal_factor.get(month, 1.0)
+                * growth_factor
+                * multiplier
+            )
+
             scenario_rows.append({
                 "Timestamp": timestamp,
                 "scenario": scenario,
-                "forecast_avg_load": max(float(avg_load * multiplier), 0.0),
-                "forecast_peak_load": max(float(peak_load * multiplier), 0.0),
+                "forecast_avg_load": max(float(avg_load), 0.0),
+                "forecast_peak_load": max(float(peak_load), 0.0),
             })
 
     scenarios_df = pd.DataFrame(scenario_rows)
@@ -471,13 +568,15 @@ def run_forecast():
 
     df = load_dataset()
     frame = build_training_frame(df)
+    expected_feature_columns = model_feature_columns(frame)
 
     print("Dataset shape:", df.shape)
     print("Training frame shape:", frame.shape)
+    print("Selected feature count:", len(expected_feature_columns))
     print("Min time:", df.index.min())
     print("Max time:", df.index.max())
 
-    if model_artifacts_are_current():
+    if model_artifacts_are_current(expected_feature_columns):
         print("Current model artifact found. Loading model...")
         model, feature_columns = load_short_term_model()
         previous_metrics = {}
@@ -492,7 +591,10 @@ def run_forecast():
         else:
             metrics = {}
     else:
-        model, feature_columns, metrics, validation_start = train_short_term_model(frame)
+        model, feature_columns, metrics, validation_start = train_short_term_model(
+            frame,
+            expected_feature_columns,
+        )
 
     forecast_15min = forecast_future_15min(
         model=model,
