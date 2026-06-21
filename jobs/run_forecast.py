@@ -1,17 +1,22 @@
 import json
+import os
 from pathlib import Path
-from datetime import datetime, timedelta
+from datetime import datetime
+
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+os.environ.setdefault("MKL_NUM_THREADS", "1")
+os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
+os.environ.setdefault("LOKY_MAX_CPU_COUNT", "1")
 
 import joblib
 import numpy as np
 import pandas as pd
-import torch
+from sklearn.ensemble import HistGradientBoostingRegressor
+from sklearn.linear_model import LinearRegression
 from sklearn.metrics import mean_absolute_error, mean_squared_error
-from sklearn.preprocessing import StandardScaler
-from torch.utils.data import TensorDataset, DataLoader
 
-from model import LSTMModel
-from preprocessing import load_and_prepare_dataset, get_feature_columns, TARGET_COLUMN
+from preprocessing import TARGET_COLUMN
 
 
 BASE_DIR = Path(__file__).resolve().parents[1]
@@ -19,22 +24,23 @@ BASE_DIR = Path(__file__).resolve().parents[1]
 DATA_PATH = BASE_DIR / "data" / "load_forecasting_dataset_corrected.csv"
 
 ARTIFACT_DIR = BASE_DIR / "artifacts"
-MODEL_PATH = ARTIFACT_DIR / "lstm_model.pth"
-SCALER_X_PATH = ARTIFACT_DIR / "scaler_X.pkl"
-SCALER_Y_PATH = ARTIFACT_DIR / "scaler_y.pkl"
-FEATURE_COLUMNS_PATH = ARTIFACT_DIR / "feature_columns.json"
+MODEL_PATH = ARTIFACT_DIR / "load_forecast_hgb.pkl"
+FEATURE_COLUMNS_PATH = ARTIFACT_DIR / "load_forecast_feature_columns.json"
 
-FORECAST_15MIN_PATH = BASE_DIR / "data" / "forecast_15min.csv"
-FORECAST_CURRENT_PATH = BASE_DIR / "data" / "forecast_current_15min.csv"
-FORECAST_HISTORY_PATH = BASE_DIR / "data" / "forecast_history_15min.csv"
-
-FORECAST_HOURLY_PATH = BASE_DIR / "data" / "forecast_hourly.csv"
-FORECAST_DAILY_PATH = BASE_DIR / "data" / "forecast_daily.csv"
-FORECAST_MONTHLY_PATH = BASE_DIR / "data" / "forecast_monthly.csv"
+FORECAST_SHORT_15MIN_PATH = BASE_DIR / "data" / "forecast_short_term_15min.csv"
+FORECAST_SHORT_HOURLY_PATH = BASE_DIR / "data" / "forecast_short_term_hourly.csv"
+FORECAST_MEDIUM_DAILY_PATH = BASE_DIR / "data" / "forecast_medium_term_daily.csv"
+FORECAST_MEDIUM_MONTHLY_PATH = BASE_DIR / "data" / "forecast_medium_term_monthly.csv"
+FORECAST_LONG_MONTHLY_PATH = BASE_DIR / "data" / "forecast_long_term_monthly.csv"
+FORECAST_LONG_SCENARIOS_PATH = BASE_DIR / "data" / "forecast_long_term_scenarios.csv"
 METRICS_PATH = BASE_DIR / "data" / "model_metrics.json"
 
-SIMULATION_LAG_YEARS = 2
-REALTIME_BUCKET_MINUTES = 15
+FREQUENCY = "15min"
+SHORT_TERM_DAYS = 7
+MEDIUM_TERM_DAYS = 180
+LONG_TERM_MONTHS = 36
+LAG_STEPS = [1, 4, 96, 192, 672]
+ROLLING_WINDOWS = [4, 96, 672]
 
 
 def prepare_directories():
@@ -42,187 +48,93 @@ def prepare_directories():
     (BASE_DIR / "data").mkdir(parents=True, exist_ok=True)
 
 
-def artifacts_exist():
+def model_artifacts_are_current() -> bool:
     return (
         MODEL_PATH.exists()
-        and SCALER_X_PATH.exists()
-        and SCALER_Y_PATH.exists()
         and FEATURE_COLUMNS_PATH.exists()
+        and MODEL_PATH.stat().st_mtime >= DATA_PATH.stat().st_mtime
+        and FEATURE_COLUMNS_PATH.stat().st_mtime >= DATA_PATH.stat().st_mtime
     )
 
 
-def get_simulated_now():
-    real_now = pd.Timestamp.now().tz_localize(None)
-    simulated_now = real_now - pd.DateOffset(years=SIMULATION_LAG_YEARS)
-    simulated_now = simulated_now.floor(f"{REALTIME_BUCKET_MINUTES}min")
-    return real_now, simulated_now
+def load_dataset() -> pd.DataFrame:
+    df = pd.read_csv(DATA_PATH)
+
+    if "Timestamp" not in df.columns:
+        raise ValueError("Dataset must contain Timestamp column")
+
+    if TARGET_COLUMN not in df.columns:
+        raise ValueError(f"Dataset must contain {TARGET_COLUMN} column")
+
+    df["Timestamp"] = pd.to_datetime(df["Timestamp"])
+    df = df.sort_values("Timestamp").drop_duplicates(subset=["Timestamp"], keep="last")
+    df = df.set_index("Timestamp")
+    df = df.apply(pd.to_numeric, errors="coerce")
+    df = df.dropna(axis=1, how="all")
+    df = df.dropna(subset=[TARGET_COLUMN])
+
+    return df
 
 
-def build_tensors(x_scaled, y_scaled):
-    x_seq = x_scaled.reshape((x_scaled.shape[0], 1, x_scaled.shape[1]))
-    x_tensor = torch.from_numpy(x_seq).float()
-    y_tensor = torch.from_numpy(y_scaled).float()
-    return x_tensor, y_tensor
+def add_calendar_features(df: pd.DataFrame) -> pd.DataFrame:
+    result = df.copy()
+    index = result.index
+
+    result["hour"] = index.hour
+    result["minute"] = index.minute
+    result["dayofweek"] = index.dayofweek
+    result["day"] = index.day
+    result["month"] = index.month
+    result["quarter"] = index.quarter
+    result["year"] = index.year
+    result["dayofyear"] = index.dayofyear
+    result["weekofyear"] = index.isocalendar().week.astype(int)
+    result["is_weekend"] = result["dayofweek"].isin([5, 6]).astype(int)
+    result["is_month_start"] = index.is_month_start.astype(int)
+    result["is_month_end"] = index.is_month_end.astype(int)
+    result["is_business_hours"] = result["hour"].between(9, 17).astype(int)
+    result["minute_of_day"] = result["hour"] * 60 + result["minute"]
+    result["minute_of_week"] = result["dayofweek"] * 24 * 60 + result["minute_of_day"]
+    result["season_no"] = result["month"] % 12 // 3 + 1
+
+    result["hour_sin"] = np.sin(2 * np.pi * result["hour"] / 24)
+    result["hour_cos"] = np.cos(2 * np.pi * result["hour"] / 24)
+    result["dow_sin"] = np.sin(2 * np.pi * result["dayofweek"] / 7)
+    result["dow_cos"] = np.cos(2 * np.pi * result["dayofweek"] / 7)
+    result["month_sin"] = np.sin(2 * np.pi * result["month"] / 12)
+    result["month_cos"] = np.cos(2 * np.pi * result["month"] / 12)
+
+    return result
 
 
-def train_model(df: pd.DataFrame, epochs: int = 10, batch_size: int = 256):
-    print("========== TRAIN LSTM MODEL ==========")
-
-    feature_columns = get_feature_columns(df)
-
-    train_df = df[df.index < "2025-01-01"].copy()
-    test_df = df[df.index >= "2025-01-01"].copy()
-
-    if train_df.empty:
-        raise ValueError("Training dataset is empty")
-
-    if test_df.empty:
-        raise ValueError("Testing dataset is empty")
-
-    x_train = train_df[feature_columns]
-    y_train = train_df[[TARGET_COLUMN]]
-
-    x_test = test_df[feature_columns]
-    y_test = test_df[[TARGET_COLUMN]]
-
-    scaler_x = StandardScaler()
-    scaler_y = StandardScaler()
-
-    x_train_scaled = scaler_x.fit_transform(x_train)
-    y_train_scaled = scaler_y.fit_transform(y_train)
-
-    x_test_scaled = scaler_x.transform(x_test)
-    y_test_scaled = scaler_y.transform(y_test)
-
-    x_train_tensor, y_train_tensor = build_tensors(x_train_scaled, y_train_scaled)
-    x_test_tensor, y_test_tensor = build_tensors(x_test_scaled, y_test_scaled)
-
-    train_loader = DataLoader(
-        TensorDataset(x_train_tensor, y_train_tensor),
-        batch_size=batch_size,
-        shuffle=True
-    )
-
-    test_loader = DataLoader(
-        TensorDataset(x_test_tensor, y_test_tensor),
-        batch_size=batch_size,
-        shuffle=False
-    )
-
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print("Using device:", device)
-
-    model = LSTMModel(
-        input_size=x_train_tensor.shape[2],
-        hidden_size=50,
-        num_layers=1
-    ).to(device)
-
-    criterion = torch.nn.MSELoss()
-    optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
-
-    for epoch in range(epochs):
-        model.train()
-        train_loss = 0.0
-
-        for inputs, targets in train_loader:
-            inputs = inputs.to(device)
-            targets = targets.to(device)
-
-            optimizer.zero_grad()
-            outputs = model(inputs)
-            loss = criterion(outputs, targets)
-
-            loss.backward()
-            optimizer.step()
-
-            train_loss += loss.item() * inputs.size(0)
-
-        train_loss = train_loss / len(train_loader.dataset)
-
-        model.eval()
-        val_loss = 0.0
-
-        with torch.no_grad():
-            for inputs, targets in test_loader:
-                inputs = inputs.to(device)
-                targets = targets.to(device)
-
-                outputs = model(inputs)
-                loss = criterion(outputs, targets)
-
-                val_loss += loss.item() * inputs.size(0)
-
-        val_loss = val_loss / len(test_loader.dataset)
-
-        print(
-            f"Epoch {epoch + 1}/{epochs} | "
-            f"train_loss={train_loss:.6f} | "
-            f"val_loss={val_loss:.6f}"
-        )
-
-    torch.save(model.state_dict(), MODEL_PATH)
-    joblib.dump(scaler_x, SCALER_X_PATH)
-    joblib.dump(scaler_y, SCALER_Y_PATH)
-
-    with open(FEATURE_COLUMNS_PATH, "w", encoding="utf-8") as f:
-        json.dump(feature_columns, f, ensure_ascii=False, indent=2)
-
-    print("Model saved:", MODEL_PATH)
-    print("Scaler X saved:", SCALER_X_PATH)
-    print("Scaler y saved:", SCALER_Y_PATH)
-    print("Feature columns saved:", FEATURE_COLUMNS_PATH)
-
-    return model, scaler_x, scaler_y, feature_columns
+def numeric_external_columns(df: pd.DataFrame) -> list[str]:
+    return [
+        col for col in df.select_dtypes(include=[np.number]).columns
+        if col != TARGET_COLUMN
+    ]
 
 
-def load_model_and_artifacts(input_size: int):
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+def add_load_lags(df: pd.DataFrame) -> pd.DataFrame:
+    result = df.copy()
 
-    model = LSTMModel(
-        input_size=input_size,
-        hidden_size=50,
-        num_layers=1
-    ).to(device)
+    for lag in LAG_STEPS:
+        result[f"load_lag_{lag}"] = result[TARGET_COLUMN].shift(lag)
 
-    model.load_state_dict(torch.load(MODEL_PATH, map_location=device))
-    model.eval()
+    previous_load = result[TARGET_COLUMN].shift(1)
 
-    scaler_x = joblib.load(SCALER_X_PATH)
-    scaler_y = joblib.load(SCALER_Y_PATH)
+    for window in ROLLING_WINDOWS:
+        result[f"load_rolling_mean_{window}"] = previous_load.rolling(window).mean()
+        result[f"load_rolling_max_{window}"] = previous_load.rolling(window).max()
+        result[f"load_rolling_min_{window}"] = previous_load.rolling(window).min()
 
-    with open(FEATURE_COLUMNS_PATH, "r", encoding="utf-8") as f:
-        feature_columns = json.load(f)
-
-    return model, scaler_x, scaler_y, feature_columns
+    return result
 
 
-def predict_dataframe(model, scaler_x, scaler_y, df: pd.DataFrame, feature_columns):
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-    x = df[feature_columns]
-    x_scaled = scaler_x.transform(x)
-
-    fake_y = np.zeros((len(x_scaled), 1))
-    x_tensor, _ = build_tensors(x_scaled, fake_y)
-
-    x_tensor = x_tensor.to(device)
-
-    predictions = []
-
-    model.eval()
-    with torch.no_grad():
-        batch_size = 512
-
-        for start in range(0, len(x_tensor), batch_size):
-            batch = x_tensor[start:start + batch_size]
-            output = model(batch)
-            predictions.append(output.cpu().numpy())
-
-    predictions_scaled = np.vstack(predictions)
-    predictions = scaler_y.inverse_transform(predictions_scaled).flatten()
-
-    return predictions
+def build_training_frame(df: pd.DataFrame) -> pd.DataFrame:
+    frame = add_calendar_features(df)
+    frame = add_load_lags(frame)
+    frame = frame.replace([np.inf, -np.inf], np.nan)
+    return frame.dropna()
 
 
 def calculate_metrics(actual, forecast):
@@ -242,181 +154,367 @@ def calculate_metrics(actual, forecast):
     }
 
 
-def build_hourly_output(result_target: pd.DataFrame):
-    df = result_target.copy()
-    df["Timestamp"] = pd.to_datetime(df["Timestamp"])
-    df = df.sort_values("Timestamp")
+def train_short_term_model(frame: pd.DataFrame):
+    print("========== TRAIN SHORT/MEDIUM TERM MODEL ==========")
 
-    df["hour_bucket"] = df["Timestamp"].dt.floor("h")
+    validation_start = frame.index.max() - pd.Timedelta(days=90)
+    train_df = frame[frame.index < validation_start].copy()
+    test_df = frame[frame.index >= validation_start].copy()
 
+    feature_columns = [col for col in frame.columns if col != TARGET_COLUMN]
+
+    model = HistGradientBoostingRegressor(
+        loss="squared_error",
+        max_iter=350,
+        learning_rate=0.06,
+        max_leaf_nodes=31,
+        l2_regularization=0.02,
+        random_state=42
+    )
+
+    model.fit(train_df[feature_columns], train_df[TARGET_COLUMN])
+    validation_forecast = model.predict(test_df[feature_columns])
+    metrics = calculate_metrics(test_df[TARGET_COLUMN].values, validation_forecast)
+
+    final_model = HistGradientBoostingRegressor(
+        loss="squared_error",
+        max_iter=350,
+        learning_rate=0.06,
+        max_leaf_nodes=31,
+        l2_regularization=0.02,
+        random_state=42
+    )
+    final_model.fit(frame[feature_columns], frame[TARGET_COLUMN])
+
+    joblib.dump(final_model, MODEL_PATH)
+
+    with open(FEATURE_COLUMNS_PATH, "w", encoding="utf-8") as f:
+        json.dump(feature_columns, f, ensure_ascii=False, indent=2)
+
+    print("Validation start:", validation_start)
+    print("Validation metrics:", metrics)
+    print("Model saved:", MODEL_PATH.name)
+
+    return final_model, feature_columns, metrics, validation_start
+
+
+def load_short_term_model():
+    with open(FEATURE_COLUMNS_PATH, "r", encoding="utf-8") as f:
+        feature_columns = json.load(f)
+
+    return joblib.load(MODEL_PATH), feature_columns
+
+
+def build_future_external_features(df: pd.DataFrame, future_index: pd.DatetimeIndex) -> pd.DataFrame:
+    external_columns = numeric_external_columns(df)
+
+    history = df[external_columns].copy()
+    history["profile_month"] = history.index.month
+    history["profile_dayofweek"] = history.index.dayofweek
+    history["profile_hour"] = history.index.hour
+    history["profile_minute"] = history.index.minute
+
+    keys = ["profile_month", "profile_dayofweek", "profile_hour", "profile_minute"]
+    profile = history.groupby(keys)[external_columns].mean().reset_index()
+
+    future = pd.DataFrame(index=future_index)
+    future["profile_month"] = future.index.month
+    future["profile_dayofweek"] = future.index.dayofweek
+    future["profile_hour"] = future.index.hour
+    future["profile_minute"] = future.index.minute
+
+    future = (
+        future
+        .reset_index(names="Timestamp")
+        .merge(profile, on=keys, how="left")
+        .set_index("Timestamp")
+        .sort_index()
+    )
+
+    means = df[external_columns].mean(numeric_only=True)
+    for col in external_columns:
+        future[col] = future[col].fillna(means[col])
+
+    future = future.drop(columns=keys)
+    future = add_calendar_features(future)
+
+    return future
+
+
+def build_expected_load_series(df: pd.DataFrame, extended_index: pd.DatetimeIndex) -> pd.Series:
+    history = df[[TARGET_COLUMN]].copy()
+    history["profile_month"] = history.index.month
+    history["profile_dayofweek"] = history.index.dayofweek
+    history["profile_hour"] = history.index.hour
+    history["profile_minute"] = history.index.minute
+
+    keys = ["profile_month", "profile_dayofweek", "profile_hour", "profile_minute"]
+    profile = history.groupby(keys)[TARGET_COLUMN].mean().reset_index()
+
+    expected = pd.DataFrame(index=extended_index)
+    expected["profile_month"] = expected.index.month
+    expected["profile_dayofweek"] = expected.index.dayofweek
+    expected["profile_hour"] = expected.index.hour
+    expected["profile_minute"] = expected.index.minute
+
+    expected = (
+        expected
+        .reset_index(names="Timestamp")
+        .merge(profile, on=keys, how="left")
+        .set_index("Timestamp")
+        .sort_index()
+    )
+
+    expected_load = expected[TARGET_COLUMN].fillna(df[TARGET_COLUMN].mean())
+    actual_overlap = df[TARGET_COLUMN].reindex(extended_index)
+    expected_load.loc[actual_overlap.notna()] = actual_overlap.dropna()
+
+    return expected_load
+
+
+def build_future_feature_frame(
+    df: pd.DataFrame,
+    future_index: pd.DatetimeIndex,
+    feature_columns: list[str],
+) -> pd.DataFrame:
+    future_features = build_future_external_features(df, future_index)
+
+    max_history = max(max(LAG_STEPS), max(ROLLING_WINDOWS))
+    extended_index = pd.date_range(
+        start=future_index.min() - pd.Timedelta(minutes=15 * max_history),
+        end=future_index.max(),
+        freq=FREQUENCY,
+    )
+    expected_load = build_expected_load_series(df, extended_index)
+
+    lag_frame = pd.DataFrame(index=extended_index)
+    lag_frame[TARGET_COLUMN] = expected_load
+
+    for lag in LAG_STEPS:
+        lag_frame[f"load_lag_{lag}"] = lag_frame[TARGET_COLUMN].shift(lag)
+
+    previous_load = lag_frame[TARGET_COLUMN].shift(1)
+    for window in ROLLING_WINDOWS:
+        lag_frame[f"load_rolling_mean_{window}"] = previous_load.rolling(window).mean()
+        lag_frame[f"load_rolling_max_{window}"] = previous_load.rolling(window).max()
+        lag_frame[f"load_rolling_min_{window}"] = previous_load.rolling(window).min()
+
+    future_frame = future_features.join(
+        lag_frame.drop(columns=[TARGET_COLUMN]).reindex(future_index),
+        how="left",
+    )
+
+    return future_frame.reindex(columns=feature_columns)
+
+
+def forecast_future_15min(
+    model,
+    df: pd.DataFrame,
+    feature_columns: list[str],
+    periods: int,
+) -> pd.DataFrame:
+    start = df.index.max() + pd.Timedelta(minutes=15)
+    future_index = pd.date_range(start=start, periods=periods, freq=FREQUENCY)
+    future_frame = build_future_feature_frame(df, future_index, feature_columns)
+    forecast_values = model.predict(future_frame)
+
+    result = pd.DataFrame({
+        "Timestamp": future_index,
+        "forecast_load": forecast_values,
+    })
+    result["horizon"] = "future"
+    result["actual_load"] = np.nan
+    result["error"] = np.nan
+    result["error_percent"] = np.nan
+
+    return result[
+        ["Timestamp", "actual_load", "forecast_load", "error", "error_percent", "horizon"]
+    ]
+
+
+def write_short_term_outputs(forecast_15min: pd.DataFrame) -> pd.DataFrame:
+    short = forecast_15min.head(SHORT_TERM_DAYS * 96).copy()
+    short.to_csv(FORECAST_SHORT_15MIN_PATH, index=False)
+
+    hourly = short.copy()
+    hourly["Timestamp"] = pd.to_datetime(hourly["Timestamp"])
+    hourly["hour_bucket"] = hourly["Timestamp"].dt.floor("h")
     hourly = (
-        df
+        hourly
         .groupby("hour_bucket", as_index=False)
-        .agg(
-            actual_load=("actual_load", "mean"),
-            forecast_load=("forecast_load", "mean"),
-            error=("error", "mean"),
-            error_percent=("error_percent", "mean")
-        )
+        .agg(forecast_load=("forecast_load", "mean"))
         .rename(columns={"hour_bucket": "Timestamp"})
     )
 
-    hourly.to_csv(FORECAST_HOURLY_PATH, index=False)
+    hourly["actual_load"] = np.nan
+    hourly["error"] = np.nan
+    hourly["error_percent"] = np.nan
+    hourly = hourly[["Timestamp", "actual_load", "forecast_load", "error", "error_percent"]]
+    hourly.to_csv(FORECAST_SHORT_HOURLY_PATH, index=False)
 
-    print("Saved hourly forecast:", FORECAST_HOURLY_PATH)
+    return short
 
 
-def build_daily_monthly_output(history_df: pd.DataFrame):
-    df = history_df.copy()
+def write_medium_term_outputs(forecast_15min: pd.DataFrame):
+    df = forecast_15min.copy()
     df["Timestamp"] = pd.to_datetime(df["Timestamp"])
-    df = df.sort_values("Timestamp")
 
-    if "error" not in df.columns:
-        df["error"] = df["actual_load"] - df["forecast_load"]
-
-    if "error_percent" not in df.columns:
-        df["error_percent"] = df["error"].abs() / df["actual_load"] * 100
-
-    df["day_bucket"] = df["Timestamp"].dt.floor("d")
-
+    daily = df.copy()
+    daily["day_bucket"] = daily["Timestamp"].dt.floor("D")
     daily = (
-        df
+        daily
         .groupby("day_bucket", as_index=False)
         .agg(
-            actual_peak_load=("actual_load", "max"),
             forecast_peak_load=("forecast_load", "max"),
-            actual_avg_load=("actual_load", "mean"),
             forecast_avg_load=("forecast_load", "mean"),
-            error_percent=("error_percent", "mean")
         )
         .rename(columns={"day_bucket": "Timestamp"})
     )
+    daily["actual_peak_load"] = np.nan
+    daily["actual_avg_load"] = np.nan
+    daily["error_percent"] = np.nan
+    daily = daily[
+        [
+            "Timestamp",
+            "actual_peak_load",
+            "forecast_peak_load",
+            "actual_avg_load",
+            "forecast_avg_load",
+            "error_percent",
+        ]
+    ]
+    daily.to_csv(FORECAST_MEDIUM_DAILY_PATH, index=False)
 
-    daily.to_csv(FORECAST_DAILY_PATH, index=False)
-
-    df["month_bucket"] = df["Timestamp"].dt.to_period("M").dt.to_timestamp()
-
+    monthly = df.copy()
+    monthly["month_bucket"] = monthly["Timestamp"].dt.to_period("M").dt.to_timestamp()
     monthly = (
-        df
+        monthly
         .groupby("month_bucket", as_index=False)
         .agg(
-            actual_peak_load=("actual_load", "max"),
             forecast_peak_load=("forecast_load", "max"),
-            actual_avg_load=("actual_load", "mean"),
             forecast_avg_load=("forecast_load", "mean"),
-            error_percent=("error_percent", "mean")
         )
         .rename(columns={"month_bucket": "Timestamp"})
     )
+    monthly["actual_peak_load"] = np.nan
+    monthly["actual_avg_load"] = np.nan
+    monthly["error_percent"] = np.nan
+    monthly = monthly[
+        [
+            "Timestamp",
+            "actual_peak_load",
+            "forecast_peak_load",
+            "actual_avg_load",
+            "forecast_avg_load",
+            "error_percent",
+        ]
+    ]
+    monthly.to_csv(FORECAST_MEDIUM_MONTHLY_PATH, index=False)
 
-    monthly.to_csv(FORECAST_MONTHLY_PATH, index=False)
 
-    print("Saved daily forecast:", FORECAST_DAILY_PATH)
-    print("Saved monthly forecast:", FORECAST_MONTHLY_PATH)
+def build_long_term_scenarios(df: pd.DataFrame):
+    monthly = (
+        df[TARGET_COLUMN]
+        .resample("MS")
+        .agg(actual_avg_load="mean", actual_peak_load="max")
+        .dropna()
+        .reset_index()
+    )
+
+    monthly["month_no"] = np.arange(len(monthly))
+    future_months = pd.date_range(
+        start=(df.index.max() + pd.offsets.MonthBegin(1)).normalize(),
+        periods=LONG_TERM_MONTHS,
+        freq="MS",
+    )
+    future_no = pd.DataFrame(
+        {"month_no": np.arange(len(monthly), len(monthly) + LONG_TERM_MONTHS)}
+    )
+
+    avg_model = LinearRegression()
+    peak_model = LinearRegression()
+    avg_model.fit(monthly[["month_no"]], monthly["actual_avg_load"])
+    peak_model.fit(monthly[["month_no"]], monthly["actual_peak_load"])
+
+    base_avg = avg_model.predict(future_no)
+    base_peak = peak_model.predict(future_no)
+
+    scenario_rows = []
+    scenarios = {
+        "low_demand": 0.95,
+        "baseline": 1.00,
+        "high_demand": 1.08,
+    }
+
+    for scenario, multiplier in scenarios.items():
+        for timestamp, avg_load, peak_load in zip(future_months, base_avg, base_peak):
+            scenario_rows.append({
+                "Timestamp": timestamp,
+                "scenario": scenario,
+                "forecast_avg_load": max(float(avg_load * multiplier), 0.0),
+                "forecast_peak_load": max(float(peak_load * multiplier), 0.0),
+            })
+
+    scenarios_df = pd.DataFrame(scenario_rows)
+    scenarios_df.to_csv(FORECAST_LONG_SCENARIOS_PATH, index=False)
+
+    baseline = scenarios_df[scenarios_df["scenario"] == "baseline"].copy()
+    baseline = baseline.drop(columns=["scenario"])
+    baseline.to_csv(FORECAST_LONG_MONTHLY_PATH, index=False)
 
 
 def run_forecast():
-    print("========== START LOAD FORECAST REALTIME -2 YEARS SIMULATION JOB ==========")
+    print("========== START LOAD FORECAST JOB ==========")
     print("Start time:", datetime.now())
 
     prepare_directories()
 
-    df = load_and_prepare_dataset(str(DATA_PATH))
+    df = load_dataset()
+    frame = build_training_frame(df)
 
     print("Dataset shape:", df.shape)
+    print("Training frame shape:", frame.shape)
     print("Min time:", df.index.min())
     print("Max time:", df.index.max())
 
-    if not artifacts_exist():
-        print("Model artifact not found or incomplete. Training model first...")
+    if model_artifacts_are_current():
+        print("Current model artifact found. Loading model...")
+        model, feature_columns = load_short_term_model()
+        previous_metrics = {}
+        validation_start = None
 
-        model, scaler_x, scaler_y, feature_columns = train_model(
-            df=df,
-            epochs=10,
-            batch_size=256
-        )
+        if METRICS_PATH.exists():
+            with open(METRICS_PATH, "r", encoding="utf-8") as f:
+                previous_metrics = json.load(f)
+
+            validation_start = previous_metrics.get("validation_start")
+            metrics = previous_metrics.get("metrics", {})
+        else:
+            metrics = {}
     else:
-        print("Model artifact found. Loading model...")
+        model, feature_columns, metrics, validation_start = train_short_term_model(frame)
 
-        with open(FEATURE_COLUMNS_PATH, "r", encoding="utf-8") as f:
-            feature_columns = json.load(f)
-
-        model, scaler_x, scaler_y, feature_columns = load_model_and_artifacts(
-            input_size=len(feature_columns)
-        )
-
-    real_now, simulated_now = get_simulated_now()
-
-    current_date = simulated_now.date()
-    target_date = current_date + timedelta(days=1)
-
-    print("Real now:", real_now)
-    print("Simulated now:", simulated_now)
-    print("Current simulation date:", current_date)
-    print("Forecast target date:", target_date)
-
-    target_df = df[df.index.date == target_date].copy()
-
-    if target_df.empty:
-        raise ValueError(f"No data found for forecast target date: {target_date}")
-
-    forecast_values = predict_dataframe(
+    forecast_15min = forecast_future_15min(
         model=model,
-        scaler_x=scaler_x,
-        scaler_y=scaler_y,
-        df=target_df,
-        feature_columns=feature_columns
+        df=df,
+        feature_columns=feature_columns,
+        periods=MEDIUM_TERM_DAYS * 96,
     )
 
-    actual_values = target_df[TARGET_COLUMN].values
-
-    result_target = pd.DataFrame({
-        "Timestamp": target_df.index,
-        "actual_load": actual_values,
-        "forecast_load": forecast_values
-    })
-
-    result_target["error"] = result_target["actual_load"] - result_target["forecast_load"]
-    result_target["error_percent"] = (
-        result_target["error"].abs() / result_target["actual_load"] * 100
-    )
-
-    result_target.to_csv(FORECAST_15MIN_PATH, index=False)
-    result_target.to_csv(FORECAST_CURRENT_PATH, index=False)
-
-    if FORECAST_HISTORY_PATH.exists():
-        history_df = pd.read_csv(FORECAST_HISTORY_PATH)
-        history_df["Timestamp"] = pd.to_datetime(history_df["Timestamp"])
-
-        combined_df = pd.concat([history_df, result_target], ignore_index=True)
-        combined_df["Timestamp"] = pd.to_datetime(combined_df["Timestamp"])
-
-        combined_df = (
-            combined_df
-            .sort_values("Timestamp")
-            .drop_duplicates(subset=["Timestamp"], keep="last")
-        )
-    else:
-        combined_df = result_target.copy()
-
-    combined_df.to_csv(FORECAST_HISTORY_PATH, index=False)
-
-    build_hourly_output(result_target)
-    build_daily_monthly_output(combined_df)
-
-    metrics = calculate_metrics(
-        actual=result_target["actual_load"].values,
-        forecast=result_target["forecast_load"].values
-    )
+    short = write_short_term_outputs(forecast_15min)
+    write_medium_term_outputs(forecast_15min)
+    build_long_term_scenarios(df)
 
     metrics_payload = {
-        "mode": "real_time_minus_2_years_simulation",
-        "model_name": "PyTorch LSTM",
-        "real_now": str(real_now),
-        "simulated_now": str(simulated_now),
-        "current_date": str(current_date),
-        "forecast_target_date": str(target_date),
-        "train_period": "2020-01-01 to 2024-12-31",
+        "mode": "forecast_from_dataset_end",
+        "model_name": "HistGradientBoostingRegressor",
+        "data_start": str(df.index.min()),
+        "data_end": str(df.index.max()),
+        "forecast_start": str(forecast_15min["Timestamp"].min()),
+        "short_term_end": str(short["Timestamp"].max()),
+        "medium_term_end": str(forecast_15min["Timestamp"].max()),
+        "long_term_months": LONG_TERM_MONTHS,
+        "validation_start": str(validation_start) if validation_start else None,
         "target": TARGET_COLUMN,
         "metrics": metrics,
         "generated_at": datetime.now().isoformat()
@@ -426,9 +524,8 @@ def run_forecast():
         json.dump(metrics_payload, f, ensure_ascii=False, indent=2)
 
     print("Metrics:", metrics_payload)
-
     print("End time:", datetime.now())
-    print("========== END LOAD FORECAST REALTIME -2 YEARS SIMULATION JOB ==========")
+    print("========== END LOAD FORECAST JOB ==========")
 
 
 if __name__ == "__main__":

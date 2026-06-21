@@ -1,16 +1,18 @@
 {
-  "mode": "real_time_minus_2_years_simulation",
-  "model_name": "PyTorch LSTM",
-  "real_now": "2026-06-21 00:25:30.206384",
-  "simulated_now": "2024-06-21 00:15:00",
-  "current_date": "2024-06-21",
-  "forecast_target_date": "2024-06-22",
-  "train_period": "2020-01-01 to 2024-12-31",
+  "mode": "forecast_from_dataset_end",
+  "model_name": "HistGradientBoostingRegressor",
+  "data_start": "2020-01-01 00:00:00",
+  "data_end": "2025-05-31 23:45:00",
+  "forecast_start": "2025-06-01 00:00:00",
+  "short_term_end": "2025-06-07 23:45:00",
+  "medium_term_end": "2025-11-27 23:45:00",
+  "long_term_months": 36,
+  "validation_start": "2025-03-02 23:45:00",
   "target": "Load Demand (kW)",
   "metrics": {
-    "mae": 1.1293,
-    "rmse": 1.3716,
-    "mape": 0.0782
+    "mae": 1.4084,
+    "rmse": 5.9875,
+    "mape": 0.108
   },
-  "generated_at": "2026-06-21T00:25:30.466425"
+  "generated_at": "2026-06-21T16:39:18.674185"
 }
